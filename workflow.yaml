@@ -1,0 +1,35 @@
+main:
+  params: [args]
+  steps:
+    - sync_all:
+        call: http.post
+        args:
+          url: https://sync-kis-data-483086982600.asia-northeast3.run.app/sync-all
+          auth:
+            type: OIDC
+            audience: https://sync-kis-data-483086982600.asia-northeast3.run.app
+
+    # run_nb_job
+    - run_nb_job:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: projects/rising-parser-464807-f6/locations/asia-northeast3/jobs/nb-job
+          body: {}
+        result: nbExec
+
+    # run_mpt_job
+    - run_mpt_job:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: projects/rising-parser-464807-f6/locations/asia-northeast3/jobs/mpt-job
+          body: {}
+        result: mptExec
+
+    # sync_analysis
+    - sync_analysis:
+        call: http.post
+        args:
+          url: https://sync-kis-data-483086982600.asia-northeast3.run.app/sync-analysis
+          auth:
+            type: OIDC
+            audience: https://sync-kis-data-483086982600.asia-northeast3.run.app
