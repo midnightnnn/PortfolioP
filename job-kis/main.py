@@ -1,15 +1,12 @@
 """main.py
-Cloud Run KIS → BigQuery ETL 파이프라인 (리팩토링)"""
+Cloud Run KIS → BigQuery ETL 파이프라인 """
 
 from dotenv import load_dotenv
 load_dotenv()
-
 from flask import Flask
 import os, json, logging, requests
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
-
-# ──────────────────── GCP & 3rd-party ────────────────────
 from google.cloud import secretmanager, firestore
 import yfinance as yf
 import pandas as pd
@@ -21,8 +18,7 @@ from google.cloud import bigquery
 import uuid
 import decimal
 import re
-from httplib2 import Http
-from google.oauth2 import service_account
+import sys
 
 
 # ──────────────────── 기본 설정 ────────────────────
@@ -39,7 +35,7 @@ BQ_PROJECT  = os.getenv("BQ_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
 BQ_DATASET  = os.getenv("BQ_DATASET", "portfolio")
 BQ_LOCATION = os.getenv("BQ_LOCATION", "asia-northeast3")
 bq = bigquery.Client(project=BQ_PROJECT)
-db = firestore.Client()          # Firestore(토큰 캐시)
+db = firestore.Client()         
 
 def T(name: str) -> str:
     return f"{BQ_PROJECT}.{BQ_DATASET}.{name}"
@@ -153,6 +149,17 @@ ASSET_CLASS_SCHEMA = [
     bigquery.SchemaField("exchange_code", "STRING"),
 ]
 
+MANUAL_SHEET_SCHEMA = [
+    bigquery.SchemaField("inquiry_date", "DATE"),
+    bigquery.SchemaField("account_nickname", "STRING"),
+    bigquery.SchemaField("currency", "STRING"),
+    bigquery.SchemaField("asset_class", "STRING"),
+    bigquery.SchemaField("product_name", "STRING"),
+    bigquery.SchemaField("ticker", "STRING"),
+    bigquery.SchemaField("eval_amount_krw", "FLOAT64"),
+    bigquery.SchemaField("purchase_amount", "FLOAT64"),
+]
+
 TABLE_SCHEMAS = {
     "assets": ASSETS_SCHEMA,
     "account_balances": ACCOUNT_BALANCES_SCHEMA,
@@ -163,6 +170,7 @@ TABLE_SCHEMAS = {
     "risk_free_rates": RISK_FREE_RATES_SCHEMA,
     "analysis": ANALYSIS_SCHEMA,
     "asset_class": ASSET_CLASS_SCHEMA,
+    "manual_sheet": MANUAL_SHEET_SCHEMA,
 }
 
 def schema_to_ddl(schema_list: list[bigquery.SchemaField]) -> str:
@@ -250,7 +258,7 @@ def ensure_all_tables():
         "dividend_history",
         "daily_exchange_rates",
         "risk_free_rates",
-        "analysis",
+        "manual_sheet",
     ]:
         schema = TABLE_SCHEMAS[tbl]
         bq_exec(f"""
@@ -357,7 +365,6 @@ def get_new_kis_token(app_key:str, app_secret:str) -> dict|None:
 def get_or_refresh_token(app_key: str, app_secret: str) -> str | None:
     doc = db.collection("api_tokens").document(f"kis_token_{app_key}")
 
-    # 캐시 확인
     try:
         snap = doc.get()
         if snap.exists:
@@ -535,7 +542,7 @@ def sync_kis_data(event: dict = {}, context=None):
                             profit_loss_rate=float(r["evlu_pfls_rt"] or 0), currency=ex2cur.get(excg,"USD"),
                         ))
 
-        # 계좌별 종합잔고(하루 1회)
+        # 계좌별 종합잔고
         if cano not in processed_balance:
             h["tr_id"] = "CTRP6548R"
             res_bal = fetch_kis_api(
@@ -612,8 +619,6 @@ def sync_kis_data(event: dict = {}, context=None):
                     "currency": o["crcy_cd"],
                 })
 
-    # ---------- BigQuery 적재 ----------
-    # assets: 오늘자 삭제 후 적재
     if asset_buf:
         assets_df = pd.DataFrame(asset_buf)
         for c in ["quantity","avg_purchase_price","current_price","purchase_amount",
@@ -623,7 +628,6 @@ def sync_kis_data(event: dict = {}, context=None):
         bq_exec(f"DELETE FROM `{T('assets')}` WHERE inquiry_date = @d", {"d": today})
         bq_load_df(T("assets"), assets_df)
 
-    # account_balances: 오늘자 삭제 후 적재
     if balances_buf:
         bal_df = pd.DataFrame(balances_buf)
         for c in ["total_assets_amount","net_assets_amount","total_deposit_amount",
@@ -633,7 +637,6 @@ def sync_kis_data(event: dict = {}, context=None):
         bq_exec(f"DELETE FROM `{T('account_balances')}` WHERE inquiry_date = @d", {"d": today})
         bq_load_df(T("account_balances"), bal_df)
 
-    # orders: MERGE
     if orders_buf:
         odf = pd.DataFrame(orders_buf)
         for c in ["total_quantity", "avg_price", "total_amount"]:
@@ -688,7 +691,6 @@ def sync_market_data():
     ensure_bq_ready_once()
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
-    # 0) BigQuery에서 보유 티커 추출
     try:
         df_tk = bq.query(
             f"""
@@ -704,11 +706,10 @@ def sync_market_data():
 
     tickers = sorted(set(tickers_from_assets) | set(HIST_TICKERS))
 
-    # 1) 모든 가격 정보를 담을 리스트(이번 변경의 핵심)
     all_prices_to_update: list[dict] = []
 
     for tk in tickers:
-        # --- (A) KRX(국내) 처리 ---
+        # (A) KRX(국내) 처리
         if _is_krx_candidate(tk):
             code = _krx_numeric_code(tk)
             last_p = None
@@ -771,7 +772,7 @@ def sync_market_data():
                         ].to_dict("records"))
             continue  
 
-        # --- (B) 해외(yfinance) 처리 ---
+        # (B) 해외(yfinance) 처리
         yf_t = _select_valid_yf_ticker(tk)
         if yf_t is None:
             logger.warning("yfinance 티커 인식 실패: %s", tk)
@@ -815,7 +816,6 @@ def sync_market_data():
                 if recs:
                     all_prices_to_update.extend(recs)
 
-    # 2) 모아둔 가격을 한 번에 MERGE
     if all_prices_to_update:
         logger.info(f"총 {len(all_prices_to_update)}개의 일별 시세 후보 레코드 수집. 정규화 및 MERGE 수행.")
         prices_df = pd.DataFrame(all_prices_to_update)
@@ -975,6 +975,49 @@ def get_manual_data_from_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataF
         logger.error("시트 읽기 실패: %s", e)
         return pd.DataFrame()
 
+def sync_manual_sheet(
+    spreadsheet_id: str = os.getenv("MANUAL_SHEET_ID"),
+    sheet_name: str = os.getenv("MANUAL_SHEET_NAME", "포트폴리오_수동데이터")
+):
+    ensure_bq_ready_once()
+    df = get_manual_data_from_sheet(spreadsheet_id, sheet_name)
+    if df is None or df.empty:
+        logger.info("수동시트: 적재할 데이터 없음")
+        return "NO_DATA", 200
+
+    base_cols = ["inquiry_date","account_nickname","currency","asset_class","product_name","ticker","eval_amount_krw"]
+    if "purchase_amount" in df.columns:
+        base_cols.append("purchase_amount")
+    df = df[base_cols].copy()
+    df["inquiry_date"] = pd.to_datetime(df["inquiry_date"]).dt.date
+    for c in ["eval_amount_krw","purchase_amount"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    stg = bq_temp_table("manual_sheet")
+    bq_load_df(stg, df, "WRITE_TRUNCATE")
+    bq_exec(f"""
+        MERGE `{T('manual_sheet')}` T
+        USING `{stg}` S
+        ON  T.inquiry_date = S.inquiry_date
+        AND T.account_nickname = S.account_nickname
+        AND T.ticker = S.ticker
+        WHEN MATCHED THEN UPDATE SET
+          currency       = S.currency,
+          asset_class    = S.asset_class,
+          product_name   = S.product_name,
+          eval_amount_krw= S.eval_amount_krw,
+          purchase_amount= COALESCE(S.purchase_amount, T.purchase_amount)
+        WHEN NOT MATCHED THEN INSERT (
+          inquiry_date, account_nickname, currency, asset_class, product_name, ticker, eval_amount_krw, purchase_amount
+        ) VALUES (
+          S.inquiry_date, S.account_nickname, S.currency, S.asset_class, S.product_name, S.ticker, S.eval_amount_krw, S.purchase_amount
+        )
+    """)
+    bq_exec(f"DROP TABLE `{stg}`")
+    logger.info("수동시트 적재 완료")
+    return "OK", 200
+
 # ──────────────────── 4) 국채금리 동기화 ────────────────────
 def sync_risk_free_rate():
     ensure_bq_ready_once()
@@ -1024,393 +1067,28 @@ def sync_risk_free_rate():
 
     return "OK", 200
 
-# ──────────────────── 5) Analysis 동기화 ────────────────────
-def sync_analysis_table():
-    ensure_bq_ready_once()
-    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-
-    last_asset = list(bq.query(
-        f"SELECT MAX(inquiry_date) FROM `{T('assets')}`", location=BQ_LOCATION
-    ).result())[0][0]
-    if not last_asset:
-        logger.info("assets 테이블이 비어 있음 → analysis 스킵")
-        return "NO_ASSETS", 200
-
-    try:
-        last_anl = list(bq.query(
-            f"SELECT MAX(inquiry_date) FROM `{T('analysis')}`", location=BQ_LOCATION
-        ).result())[0][0]
-    except Exception:
-        last_anl = None
-
-    if last_anl:
-        start = min(last_asset, last_anl + timedelta(days=1))
-    else:
-        start = list(bq.query(
-            f"SELECT MIN(inquiry_date) FROM `{T('assets')}`", location=BQ_LOCATION
-        ).result())[0][0]
-
-    manual_df = get_manual_data_from_sheet(
-        "1te6C5qjOMsE7oPxEdC5z7F9gESBLs0LFoe8QINHzkEg", "포트폴리오_수동데이터"
-    )
-    min_manual_date = manual_df["inquiry_date"].min() if isinstance(manual_df, pd.DataFrame) and not manual_df.empty else None
-    if min_manual_date and (not last_anl or min_manual_date < start):
-        start = min_manual_date
-        logger.info("과거 수동데이터 감지 → start=%s", start)
-
-    if start is None or start > last_asset:
-        logger.info("동기화할 구간 없음 (start=%s > last_asset=%s)", start, last_asset)
-        return "UP_TO_DATE", 200
-
-    logger.info("USING ASSETS TABLE = %s | USING ANALYSIS TABLE = %s", T("assets"), T("analysis"))
-    logger.info("analysis 윈도우: %s ~ %s", start, last_asset)
-
-    # ── 1) assets 로딩
-    assets_df = bq.query(
-        f"SELECT * FROM `{T('assets')}` WHERE inquiry_date BETWEEN @s AND @e",
-        bigquery.QueryJobConfig(query_parameters=[_bq_param("s", start), _bq_param("e", last_asset)]),
-        location=BQ_LOCATION
-    ).to_dataframe()
-    if assets_df.empty:
-        logger.info("윈도우 내 assets 0건 → 종료")
-        return "NO_ASSET_ROWS", 200
-
-    assets_df["inquiry_date"] = pd.to_datetime(assets_df["inquiry_date"])
-    assets_df["ticker"] = assets_df["ticker"].astype(str)
-    assets_df["account_nickname"] = assets_df["account_nickname"].astype(str)
-
-    # ── 2) 수동시트 병합 (있는 경우만)
-    combined = assets_df.copy()
-    if isinstance(manual_df, pd.DataFrame) and not manual_df.empty:
-        manual_df["inquiry_date"] = pd.to_datetime(manual_df["inquiry_date"])
-        # 숫자 컬럼 정리
-        for col in ["eval_amount_krw", "purchase_amount"]:
-            if col in manual_df.columns:
-                manual_df[col] = pd.to_numeric(
-                    manual_df[col].astype(str).str.replace(",", ""), errors="coerce"
-                )
-        assets_df = assets_df.sort_values("inquiry_date")
-        manual_df = manual_df.sort_values("inquiry_date")
-
-        # 같은 (계정,티커)에서 가장 가까운 과거 수동 값을 붙임
-        combined = pd.merge_asof(
-            assets_df, manual_df,
-            on="inquiry_date", by=["account_nickname","ticker"],
-            direction="backward", suffixes=("", "_manual"),
-        )
-        for col in ["eval_amount_krw","purchase_amount","asset_class","product_name","currency"]:
-            mc = f"{col}_manual"
-            if mc in combined.columns:
-                combined[col] = combined[mc].combine_first(combined[col])
-                combined.drop(columns=[mc], inplace=True, errors="ignore")
-
-        # 순수 수동 전용 자산 ffill (해당 계정/티커가 assets에 전혀 없을 때)
-        pure_manual_keys = manual_df[["account_nickname","ticker"]].drop_duplicates().merge(
-            assets_df[["account_nickname","ticker"]].drop_duplicates(),
-            how="left", indicator=True
-        ).query('_merge=="left_only"').drop(columns="_merge")
-        if not pure_manual_keys.empty:
-            date_range = pd.to_datetime(pd.date_range(start, last_asset, freq="D"))
-            template = pd.MultiIndex.from_product([date_range, pure_manual_keys.index],
-                                                  names=["inquiry_date","key_idx"]).to_frame(index=False)
-            template = template.merge(pure_manual_keys, left_on="key_idx", right_index=True).drop("key_idx", axis=1)
-            pure_manual_df = pd.merge(
-                template, manual_df, on=["inquiry_date","account_nickname","ticker"], how="left"
-            ).sort_values(["account_nickname","ticker","inquiry_date"])
-            fill_cols = [c for c in manual_df.columns if c not in ["inquiry_date","account_nickname","ticker"]]
-            pure_manual_df[fill_cols] = pure_manual_df.groupby(["account_nickname","ticker"])[fill_cols].ffill()
-            pure_manual_df.dropna(subset=["eval_amount_krw"], inplace=True)
-            combined = pd.concat([combined, pure_manual_df], ignore_index=True)
-
-    # ── 3) 자산분류/통화 매핑
-    try:
-        map_df = bq.query(
-            f"SELECT ticker, asset_class AS asset_class_mapped, "
-            f"currency AS currency_mapped, exchange_code AS exchange_code_mapped "
-            f"FROM `{T('asset_class')}`",
-            location=BQ_LOCATION
-        ).to_dataframe()
-    except Exception:
-        map_df = pd.DataFrame(columns=["ticker","asset_class_mapped","currency_mapped","exchange_code_mapped"])
-
-    combined = combined.merge(map_df, on="ticker", how="left")
-    for col in ("asset_class", "currency"):
-        if col not in combined.columns:
-            combined[col] = np.nan
-    combined["asset_class"] = combined["asset_class"].fillna(combined["asset_class_mapped"])
-    combined["currency"]    = combined["currency"].fillna(combined["currency_mapped"])
-    # 거래소 → 통화 추정
-    ex2cur = {"NASD":"USD","NYSE":"USD","AMEX":"USD","XNAS":"USD","XNYS":"USD",
-              "KRX":"KRW","KOSPI":"KRW","KOSDAQ":"KRW","SEHK":"HKD","TSE":"JPY"}
-    mask_no_cur = combined["currency"].isna() & combined["exchange_code"].notna()
-    combined.loc[mask_no_cur, "currency"] = combined.loc[mask_no_cur, "exchange_code"].map(ex2cur)
-    combined.drop(columns=["asset_class_mapped","currency_mapped","exchange_code_mapped"],
-                  inplace=True, errors="ignore")
-
-    to_upsert = (combined.sort_values("inquiry_date", ascending=False)
-                 .dropna(subset=["ticker","currency"])
-                 .drop_duplicates(subset=["ticker"])
-                 [["ticker","currency","exchange_code"]])
-    if not to_upsert.empty:
-        stg_cls = bq_temp_table("asset_class")
-        bq_load_df(stg_cls, to_upsert, "WRITE_TRUNCATE")
-        bq_exec(f"""
-            MERGE `{T('asset_class')}` T
-            USING `{stg_cls}` S
-            ON T.ticker=S.ticker
-            WHEN MATCHED THEN UPDATE SET currency=S.currency, exchange_code=S.exchange_code
-            WHEN NOT MATCHED THEN INSERT(ticker,currency,exchange_code)
-            VALUES(S.ticker,S.currency,S.exchange_code)
-        """)
-        bq_exec(f"DROP TABLE `{stg_cls}`")
-
-    # ── 4) 환율/배당
-    fx_df = bq.query(f"SELECT inquiry_date, rate AS usd_krw_rate FROM `{T('daily_exchange_rates')}`",
-                     location=BQ_LOCATION).to_dataframe()
-    fx_df["inquiry_date"] = pd.to_datetime(fx_df["inquiry_date"])
-    combined = combined.merge(fx_df, on="inquiry_date", how="left")
-    combined["usd_krw_rate"] = combined["usd_krw_rate"].ffill().bfill().fillna(1.0)
-
-    # 배당
-    div_df = bq.query(f"""
-        SELECT ticker, ex_dividend_date, dividend_per_share
-        FROM `{T('dividend_history')}`
-        WHERE ex_dividend_date BETWEEN @s AND @e
-    """, bigquery.QueryJobConfig(
-        query_parameters=[_bq_param("s", start), _bq_param("e", last_asset)]
-    ), location=BQ_LOCATION).to_dataframe()
-    if not div_df.empty:
-        div_df["ex_dividend_date"] = pd.to_datetime(div_df["ex_dividend_date"])
-        combined = combined.merge(
-            div_df, left_on=["ticker","inquiry_date"],
-            right_on=["ticker","ex_dividend_date"], how="left"
-        )
-    if "daily_dividend_income_krw" not in combined.columns:
-        combined["daily_dividend_income_krw"] = 0
-
-    for c in ["quantity","avg_purchase_price","purchase_amount","current_price","eval_amount","usd_krw_rate","dividend_per_share"]:
-        if c in combined.columns:
-            combined[c] = pd.to_numeric(combined[c], errors="coerce")
-
-    mask_div = combined.get("dividend_per_share").notna() & combined.get("quantity").notna() if "dividend_per_share" in combined.columns else pd.Series(False, index=combined.index)
-    if mask_div.any():
-        is_usd = combined["currency"].fillna("KRW").eq("USD")
-        combined.loc[mask_div,"daily_dividend_income_krw"] = np.where(
-            is_usd[mask_div],
-            combined.loc[mask_div,"dividend_per_share"]*combined.loc[mask_div,"quantity"]*0.85*combined.loc[mask_div,"usd_krw_rate"],
-            combined.loc[mask_div,"dividend_per_share"]*combined.loc[mask_div,"quantity"]
-        )
-    combined.drop(columns=["ex_dividend_date"], inplace=True, errors="ignore")
-
-    # ── 5) 주문 집계 → LEFT MERGE (assets 기준)
-    orders = bq.query(f"""
-        SELECT * FROM `{T('orders')}`
-        WHERE order_date BETWEEN @s AND @e
-    """, bigquery.QueryJobConfig(
-        query_parameters=[_bq_param("s", start), _bq_param("e", last_asset)]
-    ), location=BQ_LOCATION).to_dataframe()
-
-    if not orders.empty:
-        orders["order_date"] = pd.to_datetime(orders["order_date"])
-        fx_map = fx_df.set_index(fx_df["inquiry_date"].dt.date)["usd_krw_rate"].to_dict()
-        orders["rate"] = np.where(
-            orders["currency"].fillna("KRW")=="KRW",
-            1.0,
-            orders["order_date"].dt.date.map(lambda d: fx_map.get(d, 1.0))
-        )
-        for c in ["total_amount","avg_price"]:
-            orders[c] = pd.to_numeric(orders[c], errors="coerce")
-        orders["amount_krw"] = orders["total_amount"].astype(float) * orders["rate"]
-        orders["order_type"] = orders["order_type"].fillna("").str.strip()
-        orders = orders[~orders["order_type"].str.contains("정정|취소", regex=True)]
-        buy_mask  = orders["order_type"].str.contains("매수", regex=False)
-        sell_mask = orders["order_type"].str.contains("매도", regex=False)
-        orders = orders.assign(
-            buy_amount_krw  = np.where(buy_mask,  orders["amount_krw"], 0.0),
-            sell_amount_krw = np.where(sell_mask, orders["amount_krw"], 0.0),
-            buy_avg_price   = np.where(buy_mask,  orders["avg_price"], np.nan),
-            sell_avg_price  = np.where(sell_mask, orders["avg_price"], np.nan),
-            inquiry_date    = orders["order_date"],
-        )
-        agg = (orders.groupby(["inquiry_date","account_nickname","ticker"], as_index=False)
-               .agg(buy_amount_krw=("buy_amount_krw","sum"),
-                    sell_amount_krw=("sell_amount_krw","sum"),
-                    buy_avg_price=("buy_avg_price","mean"),
-                    sell_avg_price=("sell_avg_price","mean")))
-
-        keys = ["inquiry_date","account_nickname","ticker"]
-
-        combined["inquiry_date"] = pd.to_datetime(combined["inquiry_date"])
-        combined["ticker"] = combined["ticker"].astype(str)
-        combined["account_nickname"] = combined["account_nickname"].astype(str)
-        agg["inquiry_date"] = pd.to_datetime(agg["inquiry_date"])
-        agg["ticker"] = agg["ticker"].astype(str)
-        agg["account_nickname"] = agg["account_nickname"].astype(str)
-
-        combined = (combined.sort_values(keys)
-                    .drop_duplicates(subset=keys, keep="last"))
-        combined = pd.merge(combined, agg, on=keys, how="left")
-
-    for c in ["buy_amount_krw","sell_amount_krw"]:
-        if c not in combined.columns: combined[c] = 0.0
-        combined[c] = combined[c].fillna(0.0)
-    for c in ["buy_avg_price","sell_avg_price"]:
-        if c not in combined.columns: combined[c] = np.nan
-
-    # ── 6) 파생 계산 (NaN도 채우는 방식으로 보정)
-    for c in ["quantity","avg_purchase_price","purchase_amount","current_price","eval_amount","usd_krw_rate"]:
-        if c in combined.columns:
-            combined[c] = pd.to_numeric(combined[c], errors="coerce")
-
-    has_eval = "eval_amount" in combined.columns
-    has_fx   = "usd_krw_rate" in combined.columns
-    if has_eval and has_fx:
-        is_krw = combined["currency"].fillna("KRW").eq("KRW")
-        computed_eval_krw = np.where(
-            is_krw, combined["eval_amount"],
-            combined["eval_amount"] * combined["usd_krw_rate"]
-        )
-        if "eval_amount_krw" not in combined.columns:
-            combined["eval_amount_krw"] = computed_eval_krw
-        else:
-            fill_mask = combined["eval_amount_krw"].isna()
-            combined.loc[fill_mask, "eval_amount_krw"] = computed_eval_krw[fill_mask]
-
-    if "book_cost_krw" not in combined.columns:
-        combined["book_cost_krw"] = np.where(
-            combined["currency"].fillna("KRW").eq("KRW"),
-            combined["purchase_amount"],
-            combined["purchase_amount"] * combined["usd_krw_rate"]
-        )
-    else:
-        fill_mask = combined["book_cost_krw"].isna()
-        combined.loc[fill_mask, "book_cost_krw"] = np.where(
-            combined.loc[fill_mask, "currency"].fillna("KRW").eq("KRW"),
-            combined.loc[fill_mask, "purchase_amount"],
-            combined.loc[fill_mask, "purchase_amount"] * combined.loc[fill_mask, "usd_krw_rate"]
-        )
-
-    if "eval_profit_loss_amount_krw" not in combined.columns:
-        combined["eval_profit_loss_amount_krw"] = combined["eval_amount_krw"] - combined["book_cost_krw"]
-    else:
-        fill_mask = combined["eval_profit_loss_amount_krw"].isna()
-        combined.loc[fill_mask, "eval_profit_loss_amount_krw"] = (
-            combined.loc[fill_mask, "eval_amount_krw"] - combined.loc[fill_mask, "book_cost_krw"]     )
-
-    if "daily_dividend_income_krw" not in combined.columns:
-        combined["daily_dividend_income_krw"] = 0
-    combined["daily_dividend_income_krw"] = combined["daily_dividend_income_krw"].fillna(0)
-
-    # ── 7) 전략 가중치(weights)
-    try:
-        w_df = bq.query(f"""
-            WITH latest_alloc AS (
-              SELECT ticker, strategy, weight,
-                     ROW_NUMBER() OVER(PARTITION BY ticker, strategy ORDER BY run_date DESC) rn
-              FROM `{T('target_allocations')}` WHERE run_date <= @today
-            )
-            SELECT ticker, strategy, weight FROM latest_alloc WHERE rn=1
-        """, bigquery.QueryJobConfig(query_parameters=[_bq_param("today", today)]),
-           location=BQ_LOCATION).to_dataframe()
-    except Exception:
-        w_df = pd.DataFrame()
-
-    if w_df.empty:
-        strategies: list[str] = []
-        wm: dict[str, dict[str, float]] = {}
-    else:
-        w_df["weight"] = pd.to_numeric(w_df["weight"], errors="coerce").fillna(0.0).astype(float)
-        strategies = sorted(w_df["strategy"].dropna().unique().tolist())
-        wm = {t: {s: w for s, w in zip(g["strategy"], g["weight"])}
-              for t, g in w_df.groupby("ticker")}
-
-    def build_weights(ticker: str):
-        if not strategies:
-            return []
-        m = wm.get(str(ticker), {})
-        return [{"strategy": s, "weight": float(m.get(s, 0.0))} for s in strategies]
-
-    combined["ticker"] = combined["ticker"].astype(str)
-    combined["weights"] = combined["ticker"].apply(build_weights)
-
-    # ── 8) 최종 업서트
-    final_cols = [
-        "inquiry_date","account_nickname","ticker","product_name","asset_class","currency",
-        "quantity","avg_purchase_price","purchase_amount","current_price","eval_amount",
-        "usd_krw_rate","eval_amount_krw","eval_profit_loss_amount_krw",
-        "daily_dividend_income_krw","buy_amount_krw","sell_amount_krw",
-        "buy_avg_price","sell_avg_price","weights"
-    ]
-    for c in final_cols:
-        if c not in combined.columns: combined[c] = np.nan
-
-    combined = combined[final_cols].copy()
-    combined["inquiry_date"] = pd.to_datetime(combined["inquiry_date"]).dt.date
-    combined["ticker"] = combined["ticker"].astype(str)
-    combined["account_nickname"] = combined["account_nickname"].astype(str)
-
-    if combined.empty:
-        logger.info("업서트할 행이 없음 → MERGE 스킵")
-        return "NO_COMBINED_ROWS", 200
-
-    stg = bq_temp_table("analysis")
-    bq_load_df(stg, combined, "WRITE_TRUNCATE")
-    bq_exec(f"""
-        MERGE `{T('analysis')}` T
-        USING `{stg}` S
-        ON  T.inquiry_date = S.inquiry_date
-        AND T.account_nickname = S.account_nickname
-        AND T.ticker = S.ticker
-        WHEN MATCHED THEN UPDATE SET
-          product_name=S.product_name, asset_class=S.asset_class, currency=S.currency,
-          quantity=S.quantity, avg_purchase_price=S.avg_purchase_price, purchase_amount=S.purchase_amount,
-          current_price=S.current_price, eval_amount=S.eval_amount, usd_krw_rate=S.usd_krw_rate,
-          eval_amount_krw=S.eval_amount_krw, eval_profit_loss_amount_krw=S.eval_profit_loss_amount_krw,
-          daily_dividend_income_krw=S.daily_dividend_income_krw, buy_amount_krw=S.buy_amount_krw,
-          sell_amount_krw=S.sell_amount_krw, buy_avg_price=S.buy_avg_price, sell_avg_price=S.sell_avg_price,
-          weights=S.weights
-        WHEN NOT MATCHED THEN INSERT (
-          inquiry_date, account_nickname, ticker, product_name, asset_class, currency,
-          quantity, avg_purchase_price, purchase_amount, current_price, eval_amount,
-          usd_krw_rate, eval_amount_krw, eval_profit_loss_amount_krw,
-          daily_dividend_income_krw, buy_amount_krw, sell_amount_krw, buy_avg_price, sell_avg_price, weights
-        ) VALUES (
-          S.inquiry_date, S.account_nickname, S.ticker, S.product_name, S.asset_class, S.currency,
-          S.quantity, S.avg_purchase_price, S.purchase_amount, S.current_price, S.eval_amount,
-          S.usd_krw_rate, S.eval_amount_krw, S.eval_profit_loss_amount_krw,
-          S.daily_dividend_income_krw, S.buy_amount_krw, S.sell_amount_krw, S.buy_avg_price, S.sell_avg_price, S.weights
-        )
-    """)
-    bq_exec(f"DROP TABLE `{stg}`")
-
-    logger.info("Analysis 동기화 완료(BigQuery) | upsert_rows=%d", len(combined))
-    return "OK", 200
-
-# ────────────────────  전체 파이프라인 ────────────────────
+# ────────────────────  전체 파이프라인 ────────────────────
 def sync_all_data():
     ensure_bq_ready_once()
+    logger.info("=== 전체 파이프라인 시작 ===")
     sync_kis_data()
     sync_market_data()
     sync_risk_free_rate()
-    sync_analysis_table()
-    return "OK",200
-
-# ──────────────────── Cloud Run 엔드포인트 ────────────────────
-@app.route("/manual", methods=["POST"])
-def ep_kis():      return sync_kis_data()
-
-@app.route("/sync-market-data", methods=["POST"])
-def ep_mkt():      return sync_market_data()
-
-@app.route("/sync-risk-free-rate", methods=["POST"])
-def ep_rfr():      return sync_risk_free_rate()
-
-@app.route("/sync-analysis", methods=["POST"])
-def ep_anl():      return sync_analysis_table()
-
-@app.route("/sync-all", methods=["POST"])
-def ep_all():      return sync_all_data()
-
-# ──────────────────── 로컬 테스트 ────────────────────
+    logger.info("=== 전체 파이프라인 성공적으로 완료 ===")
+    return "OK"
+    
+# ──────────────────── 로컬/Job 실행 ────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    mode = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("RUN_TASK", "all")).strip().lower()
+    ensure_bq_ready_once()
+    if mode in ("sync-kis", "kis"):
+        sync_kis_data()
+    elif mode in ("sync-market", "market"):
+        sync_market_data()
+    elif mode in ("sync-rfr", "rfr", "riskfree"):
+        sync_risk_free_rate()
+    elif mode in ("sync-manual", "manual"):
+        sync_manual_sheet()
+    else:
+        sync_all_data()
+

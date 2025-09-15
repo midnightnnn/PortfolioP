@@ -1,5 +1,5 @@
-"""main_mpt.py — BigQuery only
-워크포워드 백테스트 + 8가지 자산배분 가중치 계산 (PG 제거, BQ 단독)
+"""main_mpt.py
+워크포워드 백테스트 + 8가지 자산배분 가중치 계산
 """
 
 import logging, os, sys, argparse
@@ -90,7 +90,6 @@ def bq_load_df(table: str, df: pd.DataFrame, write_disposition="WRITE_APPEND"):
     job.result()
 
 def _ensure_bq_result_tables():
-    """필요 결과 테이블 생성 (있으면 통과)"""
     if not BQ_MIRROR: return
     bq_exec(f"""
       CREATE TABLE IF NOT EXISTS `{T('target_allocations')}` (
@@ -119,7 +118,6 @@ def _ensure_bq_result_tables():
 
 # ────────────────────── 전략/안정화 파라미터 ──────────────────────
 REPLACEMENTS = {
-    # 필요 시 티커 프록시: 보유 데이터 가용성 문제 방지용 (직접 최적화엔 영향 없음)
     "SCHD": "SPY",
     "QQQM": "QQQ",
     "VGLT": "TLT",
@@ -384,7 +382,7 @@ def _calc_returns(start: datetime, today: datetime, exclude_tickers: Tuple[str, 
     rets_div   = divs.div(prices.shift(1))
     returns    = rets_price.add(rets_div, fill_value=0)
 
-    # 유효성 필터(60영업일 이상 존재)
+    # 유효성 필터
     valid_cols = (prices.notna().sum() >= 60)
     returns    = returns.loc[:, valid_cols]
     returns    = returns.replace([np.inf, -np.inf], np.nan)
@@ -826,7 +824,7 @@ def batch_backtest(today: date, returns_inc: pd.DataFrame, returns_exc: pd.DataF
         nav_rows.extend(nav_df.to_dict("records"))
 
         for r in alloc_bt:
-            r["strategy"] = strat  # base → strat로 치환
+            r["strategy"] = strat 
         alloc_rows_bt.extend(alloc_bt)
 
     _bq_mirror_backtest_nav(today, nav_rows)

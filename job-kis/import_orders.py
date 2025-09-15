@@ -13,13 +13,10 @@ import sqlalchemy
 import sqlalchemy.orm
 from google.cloud import firestore
 
-# ────────────────────────────────────────────────────────────────────────────
-# 기본 설정 & 전역
-# ────────────────────────────────────────────────────────────────────────────
-# ▼▼▼ 주문 조회 기간을 여기서 지정하세요 ▼▼▼
+
+# 기본 설정
 START_DATE_STR = "20220101"
 END_DATE_STR = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-# ▲▲▲ 날짜 설정은 여기까지 ▲▲▲
 
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 app = Flask(__name__)
@@ -50,9 +47,8 @@ def get_conn():
         password=DB_PASS, db=DB_NAME, ip_type=IPTypes.PRIVATE
     )
 
-# ────────────────────────────────────────────────────────────────────────────
+
 # 테이블 정의 (Order 테이블만 필요)
-# ────────────────────────────────────────────────────────────────────────────
 class Order(Base):
     __tablename__ = "orders"
     id = sqlalchemy.Column(sqlalchemy.Integer, primary_key=True)
@@ -70,11 +66,10 @@ class Order(Base):
     currency = sqlalchemy.Column(sqlalchemy.String(10))
     __table_args__ = (sqlalchemy.UniqueConstraint('account_number', 'order_number', 'market', name='_account_order_market_uc'),)
 
-# ────────────────────────────────────────────────────────────────────────────
-# KIS 헬퍼 (기존 코드와 동일)
-# ────────────────────────────────────────────────────────────────────────────
+
+# KIS 헬퍼
 def get_kis_configs():
-    logger.info("🔐 SecretManager에서 KIS 계정 불러오는 중…")
+    logger.info("SecretManager에서 KIS 계정 불러오는 중…")
     client = secretmanager.SecretManagerServiceClient()
     project_id = os.environ.get("GCP_PROJECT_ID")
     if not project_id: raise ValueError("GCP_PROJECT_ID 환경 변수가 설정되지 않았습니다.")
@@ -93,7 +88,7 @@ def get_new_kis_token(app_key: str, app_secret: str) -> dict | None:
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         return {"token": data.get("access_token"), "expires_at": expires_at}
     except Exception as e:
-        logger.error("❌ 새 토큰 발급 실패 (appkey: ...%s): %s", app_key[-4:], e); return None
+        logger.error("새 토큰 발급 실패 (appkey: ...%s): %s", app_key[-4:], e); return None
 
 def get_or_refresh_token(app_key: str, app_secret: str) -> str | None:
     if not db:
@@ -107,19 +102,19 @@ def get_or_refresh_token(app_key: str, app_secret: str) -> str | None:
         if doc.exists:
             token_data = doc.to_dict()
             if token_data.get('expires_at') and token_data['expires_at'].replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
-                logger.info("✅ Firestore에서 유효한 토큰 발견 (appkey: ...%s)", app_key[-4:]); return token_data.get('token')
+                logger.info("Firestore에서 유효한 토큰 발견 (appkey: ...%s)", app_key[-4:]); return token_data.get('token')
             else:
-                logger.info("⚠️ Firestore 토큰 만료, 새 토큰 발급 시도 (appkey: ...%s)", app_key[-4:])
+                logger.info("Firestore 토큰 만료, 새 토큰 발급 시도 (appkey: ...%s)", app_key[-4:])
     except Exception as e:
-        logger.error(f"🔥 Firestore에서 토큰 읽기 실패: {e}")
+        logger.error(f"Firestore에서 토큰 읽기 실패: {e}")
 
     new_token_data = get_new_kis_token(app_key, app_secret)
     if new_token_data and new_token_data.get('token'):
         try:
             token_doc_ref.set(new_token_data)
-            logger.info("✅ 새 토큰을 발급하여 Firestore에 저장 완료 (appkey: ...%s)", app_key[-4:]); return new_token_data.get('token')
+            logger.info("새 토큰을 발급하여 Firestore에 저장 완료 (appkey: ...%s)", app_key[-4:]); return new_token_data.get('token')
         except Exception as e:
-            logger.error(f"🔥 Firestore에 토큰 저장 실패: {e}"); return new_token_data.get('token')
+            logger.error(f"Firestore에 토큰 저장 실패: {e}"); return new_token_data.get('token')
     return None
 
 def fetch_kis_api(url: str, headers: dict, params: dict) -> dict | None:
@@ -143,7 +138,7 @@ def fetch_kis_api(url: str, headers: dict, params: dict) -> dict | None:
             data = res.json()
             if data.get("rt_cd") != "0":
                 if data.get("msg_cd") not in ["EGW00121", "APBK0013"]:
-                    logger.warning("⚠️ KIS API 오류: %s (tr_id: %s)", data.get("msg1"), tr_id)
+                    logger.warning("KIS API 오류: %s (tr_id: %s)", data.get("msg1"), tr_id)
                 break
 
             output_key = "output" if "output" in data else "output1"
@@ -160,17 +155,16 @@ def fetch_kis_api(url: str, headers: dict, params: dict) -> dict | None:
                 params[ctx_nk_key] = nk_val
 
                 if not fk_val or not nk_val: break
-                logger.info(f"📜 연속 조회 진행... (tr_id: {tr_id})")
+                logger.info(f"연속 조회 진행... (tr_id: {tr_id})")
             else:
                 break
         except Exception as e:
-            logger.error("❌ API 호출 실패: %s (tr_id: %s)", e, tr_id); return None
+            logger.error("API 호출 실패: %s (tr_id: %s)", e, tr_id); return None
 
     return all_outputs if all_outputs["output1"] else None
 
-# ────────────────────────────────────────────────────────────────────────────
-# 메인 주문 기록 함수 (수정 완료)
-# ────────────────────────────────────────────────────────────────────────────
+
+# 메인 주문 기록 함수
 def import_historical_orders(start_date_str, end_date_str):
     global db_engine
     if db_engine is None:
@@ -180,13 +174,13 @@ def import_historical_orders(start_date_str, end_date_str):
     Session = sqlalchemy.orm.sessionmaker(bind=db_engine, expire_on_commit=False)
     session = Session()
 
-    logger.info("🗂️ DB에서 기존 주문 내역을 불러와 중복을 방지합니다...")
+    logger.info("DB에서 기존 주문 내역을 불러와 중복을 방지합니다...")
     try:
         existing_orders_query = session.query(Order.account_number, Order.order_number, Order.market).all()
         existing_orders = {f"{o.account_number}-{o.order_number}-{o.market}" for o in existing_orders_query}
         logger.info(f"현재 DB에 저장된 주문 수: {len(existing_orders)}건")
     except Exception as e:
-        logger.error(f"❌ 기존 주문 내역 조회 실패: {e}")
+        logger.error(f"기존 주문 내역 조회 실패: {e}")
         session.close()
         return
 
@@ -194,28 +188,24 @@ def import_historical_orders(start_date_str, end_date_str):
         configs = get_kis_configs()
         accounts = configs.get("ACCOUNTS", [])
     except Exception as e:
-        logger.error("❌ SecretManager 오류: %s", e)
+        logger.error("SecretManager 오류: %s", e)
         session.close()
         return
 
     total_new_orders = 0
     three_months_ago_str = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=90)).strftime("%Y%m%d")
-
-    # --- ▼▼▼ [개선] 날짜 분할(Chunking) 로직 추가 ▼▼▼ ---
     start_date = datetime.strptime(start_date_str, "%Y%m%d").date()
     end_date = datetime.strptime(end_date_str, "%Y%m%d").date()
     current_start_date = start_date
 
     while current_start_date <= end_date:
-        # 90일 단위로 기간을 나눔
         current_end_date = current_start_date + timedelta(days=89)
         if current_end_date > end_date:
             current_end_date = end_date
 
         chunk_start_str = current_start_date.strftime("%Y%m%d")
         chunk_end_str = current_end_date.strftime("%Y%m%d")
-        logger.info(f"\n🗓️ === 조회 구간 처리 시작: {chunk_start_str} ~ {chunk_end_str} === 🗓️")
-        # --- ▲▲▲ 날짜 분할 로직 끝 ▲▲▲ ---
+        logger.info(f"\n조회 구간 처리 시작: {chunk_start_str} ~ {chunk_end_str}")
 
         for acc in accounts:
             nickname, cano, prdt_cd = acc.get("nickname", "N/A"), acc.get("cano"), acc.get("prdt_cd", "01")
@@ -226,20 +216,18 @@ def import_historical_orders(start_date_str, end_date_str):
             logger.info("─" * 10 + f" 계좌 처리 시작: {nickname} ({cano}-{prdt_cd}) " + "─" * 10)
             token = get_or_refresh_token(acc["app_key"], acc["app_secret"])
             if not token:
-                logger.error("❌ 토큰 없음 – %s 계좌 건너뜀", nickname)
+                logger.error("토큰 없음 – %s 계좌 건너뜀", nickname)
                 continue
 
             headers = {"authorization": f"Bearer {token}", "appkey": acc["app_key"], "appsecret": acc["app_secret"], "tr_id": ""}
 
             # 1. 국내 주식 주문 내역 조회
             try:
-                # --- ▼▼▼ [수정] 동적 tr_id 할당 로직 ▼▼▼ ---
                 if chunk_start_str < three_months_ago_str:
                     headers["tr_id"] = "CTSC9215R"
                 else:
                     headers["tr_id"] = "TTTC0081R"
-                logger.info(f"➡️  국내주식({headers['tr_id']}) 주문내역 조회")
-                # --- ▲▲▲ 수정 완료 ▲▲▲ ---
+                logger.info(f"국내주식({headers['tr_id']}) 주문내역 조회")
 
                 params_domestic = {"CANO": cano, "ACNT_PRDT_CD": prdt_cd, "INQR_STRT_DT": chunk_start_str, "INQR_END_DT": chunk_end_str, "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": "", "CCLD_DVSN": "01", "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_3": "00", "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
                 res_orders = fetch_kis_api(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld", headers, params_domestic)
@@ -259,12 +247,12 @@ def import_historical_orders(start_date_str, end_date_str):
                         logger.info(f"✔️ 국내주식: {len(res_orders['output1'])}건 조회, 신규 {added_in_call}건 추가")
 
             except Exception as e:
-                logger.error(f"❌ '{nickname}' 계좌 국내 주문 처리 중 오류: {e}", exc_info=True)
+                logger.error(f"'{nickname}' 계좌 국내 주문 처리 중 오류: {e}", exc_info=True)
 
             # 2. 해외 주식 주문 내역 조회
             try:
                 headers["tr_id"] = "CTOS4001R"
-                logger.info(f"➡️  해외주식({headers['tr_id']}) 주문내역 조회")
+                logger.info(f"해외주식({headers['tr_id']}) 주문내역 조회")
                 params_overseas = {"CANO": cano, "ACNT_PRDT_CD": prdt_cd, "ERLM_STRT_DT": chunk_start_str, "ERLM_END_DT": chunk_end_str, "OVRS_EXCG_CD": "", "PDNO": "", "SLL_BUY_DVSN_CD": "00", "LOAN_DVSN_CD": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
                 res_overseas = fetch_kis_api(f"{KIS_BASE_URL}/uapi/overseas-stock/v1/trading/inquire-period-trans", headers, params_overseas)
                 
@@ -281,10 +269,10 @@ def import_historical_orders(start_date_str, end_date_str):
                     
                     if added_in_call > 0:
                         total_new_orders += added_in_call
-                        logger.info(f"✔️ 해외주식: {len(res_overseas['output1'])}건 조회, 신규 {added_in_call}건 추가")
+                        logger.info(f"해외주식: {len(res_overseas['output1'])}건 조회, 신규 {added_in_call}건 추가")
 
             except Exception as e:
-                logger.error(f"❌ '{nickname}' 계좌 해외 주문 처리 중 오류: {e}", exc_info=True)
+                logger.error(f"'{nickname}' 계좌 해외 주문 처리 중 오류: {e}", exc_info=True)
         
         # 다음 조회 기간으로 설정
         current_start_date = current_end_date + timedelta(days=1)
@@ -292,18 +280,17 @@ def import_historical_orders(start_date_str, end_date_str):
     try:
         if total_new_orders > 0:
             session.commit()
-            logger.info(f"\n🎉 최종 커밋 완료! 총 {total_new_orders}건의 새로운 주문 내역을 DB에 저장했습니다.")
+            logger.info(f"\n최종 커밋 완료! 총 {total_new_orders}건의 새로운 주문 내역을 DB에 저장했습니다.")
         else:
-            logger.info("\n✅ 새로운 주문 내역이 없어 커밋할 내용이 없습니다.")
+            logger.info("\n새로운 주문 내역이 없어 커밋할 내용이 없습니다.")
     except Exception as e:
-        logger.error("❌ 최종 DB 커밋 실패: %s", e)
+        logger.error("최종 DB 커밋 실패: %s", e)
         session.rollback()
     finally:
         session.close()
 
-# ────────────────────────────────────────────────────────────────────────────
+
 # Cloud Run 수동 엔드포인트
-# ────────────────────────────────────────────────────────────────────────────
 @app.route("/import-orders", methods=["POST"])
 def manual_trigger():
     logger.info(f"🛠️ 수동 /import-orders 트리거 호출 (조회 기간: {START_DATE_STR} ~ {END_DATE_STR})")
@@ -311,7 +298,7 @@ def manual_trigger():
         import_historical_orders(START_DATE_STR, END_DATE_STR)
         return f"Order import complete. Processed period: {START_DATE_STR} to {END_DATE_STR}.", 200
     except Exception as e:
-        logger.error("❌ Manual Trigger 실패: %s", e, exc_info=True)
+        logger.error("Manual Trigger 실패: %s", e, exc_info=True)
         return "Internal Server Error", 500
 
 if __name__ == '__main__':

@@ -1,5 +1,5 @@
 """NBEATS.py
-Cloud Run Job – BigQuery 전용 N-BEATS 기반 예상 연간수익률 산출
+N-BEATS 기반 예상 연간수익률 산출
 """
 
 import os, logging, warnings, math, uuid
