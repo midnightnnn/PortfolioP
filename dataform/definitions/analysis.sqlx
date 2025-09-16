@@ -1,0 +1,325 @@
+config {
+  type: "incremental",
+  schema: "portfolio",
+  tags: ["analysis"],
+  uniqueKey: ["inquiry_date","account_nickname","ticker"],
+  bigquery: {
+    partitionBy: "inquiry_date",
+    clusterBy: ["account_nickname","ticker"],
+    updatePartitionFilter: "inquiry_date >= DATE_SUB(CURRENT_DATE('Asia/Seoul'), INTERVAL 7 DAY)"
+  }
+}
+
+WITH
+assets_base AS (
+  SELECT * FROM `rising-parser-464807-f6.portfolio.assets`
+),
+manual_base AS (
+  WITH manual_ranked AS (
+    SELECT
+      SAFE_CAST(JSON_VALUE(TO_JSON_STRING(t), '$.inquiry_date') AS DATE) AS inquiry_date,
+      JSON_VALUE(TO_JSON_STRING(t), '$.account_nickname') AS account_nickname,
+      JSON_VALUE(TO_JSON_STRING(t), '$.ticker')            AS ticker,
+      SAFE_CAST(REPLACE(NULLIF(JSON_VALUE(TO_JSON_STRING(t), '$.eval_amount_krw'), ''), ',', '') AS FLOAT64) AS eval_amount_krw,
+      SAFE_CAST(REPLACE(NULLIF(JSON_VALUE(TO_JSON_STRING(t), '$.purchase_amount'), ''), ',', '') AS FLOAT64) AS purchase_amount,
+      JSON_VALUE(TO_JSON_STRING(t), '$.asset_class')  AS asset_class,
+      JSON_VALUE(TO_JSON_STRING(t), '$.product_name') AS product_name,
+      JSON_VALUE(TO_JSON_STRING(t), '$.currency')     AS currency,
+      ROW_NUMBER() OVER (
+        PARTITION BY JSON_VALUE(TO_JSON_STRING(t), '$.account_nickname'),
+                     JSON_VALUE(TO_JSON_STRING(t), '$.ticker')
+        ORDER BY SAFE_CAST(JSON_VALUE(TO_JSON_STRING(t), '$.inquiry_date') AS DATE) DESC
+      ) AS rn
+    FROM `rising-parser-464807-f6.portfolio.manual_sheet` AS t
+  )
+  SELECT
+    account_nickname,
+    ticker,
+    eval_amount_krw,
+    purchase_amount,
+    asset_class,
+    product_name,
+    currency
+  FROM manual_ranked
+  WHERE rn = 1
+),
+dates AS (
+  SELECT DISTINCT inquiry_date, account_nickname, ticker
+  FROM assets_base
+),
+manual_ffill AS (
+  SELECT
+    d.inquiry_date,
+    d.account_nickname,
+    d.ticker,
+    LAST_VALUE(m.eval_amount_krw IGNORE NULLS) OVER (
+      PARTITION BY d.account_nickname, d.ticker
+      ORDER BY d.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS eval_amount_krw,
+    LAST_VALUE(m.purchase_amount IGNORE NULLS) OVER (
+      PARTITION BY d.account_nickname, d.ticker
+      ORDER BY d.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS purchase_amount,
+    LAST_VALUE(m.asset_class IGNORE NULLS) OVER (
+      PARTITION BY d.account_nickname, d.ticker
+      ORDER BY d.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS asset_class,
+    LAST_VALUE(m.product_name IGNORE NULLS) OVER (
+      PARTITION BY d.account_nickname, d.ticker
+      ORDER BY d.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS product_name,
+    LAST_VALUE(m.currency IGNORE NULLS) OVER (
+      PARTITION BY d.account_nickname, d.ticker
+      ORDER BY d.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS currency
+  FROM dates d
+  LEFT JOIN manual_base m
+    USING (account_nickname, ticker)
+),
+combined0 AS (
+  SELECT
+    a.*,
+    m.eval_amount_krw  AS manual_eval_amount_krw,
+    m.purchase_amount  AS manual_purchase_amount,
+    m.asset_class      AS manual_asset_class,
+    m.product_name     AS manual_product_name,
+    m.currency         AS manual_currency
+  FROM assets_base a
+  LEFT JOIN manual_ffill m
+    USING (inquiry_date, account_nickname, ticker)
+),
+with_map AS (
+  SELECT
+    c.*,
+    ac.asset_class AS map_asset_class
+  FROM combined0 c
+  LEFT JOIN `rising-parser-464807-f6.portfolio.asset_class` ac
+    USING (ticker)
+),
+calendar AS (
+  SELECT DISTINCT inquiry_date FROM dates
+),
+fx_ffill AS (
+  SELECT
+    cal.inquiry_date,
+    LAST_VALUE(f.rate IGNORE NULLS) OVER (
+      ORDER BY cal.inquiry_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS usd_krw_rate
+  FROM calendar cal
+  LEFT JOIN `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+    USING (inquiry_date)
+),
+divs AS (
+  SELECT ticker, ex_dividend_date AS inquiry_date, dividend_per_share
+  FROM `rising-parser-464807-f6.portfolio.dividend_history`
+),
+orders_agg AS (
+  SELECT
+    order_date AS inquiry_date,
+    account_nickname,
+    ticker,
+    SUM(
+      IF(CONTAINS_SUBSTR(order_type, "매수"),
+         total_amount * IF(currency = "KRW", 1,
+           (SELECT f.rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+             WHERE f.inquiry_date = o.order_date)
+         ),
+         0)
+    ) AS buy_amount_krw,
+    SUM(
+      IF(CONTAINS_SUBSTR(order_type, "매도"),
+         total_amount * IF(currency = "KRW", 1,
+           (SELECT f.rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+             WHERE f.inquiry_date = o.order_date)
+         ),
+         0)
+    ) AS sell_amount_krw,
+    AVG(IF(CONTAINS_SUBSTR(order_type, "매수"), avg_price, NULL)) AS buy_avg_price,
+    AVG(IF(CONTAINS_SUBSTR(order_type, "매도"), avg_price, NULL)) AS sell_avg_price
+  FROM `rising-parser-464807-f6.portfolio.orders` o
+  WHERE NOT REGEXP_CONTAINS(IFNULL(order_type, ''), r'(정정|취소)')
+  GROUP BY 1,2,3
+),
+weights AS (
+  SELECT
+    ticker,
+    ARRAY_AGG(STRUCT(strategy, weight) ORDER BY strategy) AS weights
+  FROM (
+    SELECT
+      ticker, strategy, weight,
+      ROW_NUMBER() OVER (PARTITION BY ticker, strategy ORDER BY run_date DESC) rn
+    FROM `rising-parser-464807-f6.portfolio.target_allocations`
+    WHERE run_date <= CURRENT_DATE("Asia/Seoul")
+  )
+  WHERE rn = 1
+  GROUP BY 1
+),
+final AS (
+  SELECT
+    c.inquiry_date,
+    c.account_nickname,
+    c.ticker,
+    COALESCE(c.manual_product_name, c.product_name) AS product_name,
+    COALESCE(c.manual_asset_class, c.map_asset_class) AS asset_class,
+    CASE
+      WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+      WHEN c.currency       IS NOT NULL THEN c.currency
+      WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+      WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+      WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+      WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'  
+      ELSE NULL
+    END AS currency,
+
+    c.quantity,
+    c.avg_purchase_price,
+    COALESCE(c.manual_purchase_amount, c.purchase_amount) AS purchase_amount,
+    c.current_price,
+    c.eval_amount,
+    fx.usd_krw_rate,
+    COALESCE(
+      c.manual_eval_amount_krw,
+      IF(
+        CASE
+          WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+          WHEN c.currency       IS NOT NULL THEN c.currency
+          WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+          WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+          WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+          WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'
+          ELSE NULL
+        END = 'KRW',
+        c.eval_amount,
+        c.eval_amount * fx.usd_krw_rate
+      )
+    ) AS eval_amount_krw,
+    IF(
+      CASE
+        WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+        WHEN c.currency       IS NOT NULL THEN c.currency
+        WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+        WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+        WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+        WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'
+        ELSE NULL
+      END = 'KRW',
+      COALESCE(c.manual_purchase_amount, c.purchase_amount),
+      COALESCE(c.manual_purchase_amount, c.purchase_amount) * fx.usd_krw_rate
+    ) AS book_cost_krw,
+    COALESCE(
+      (
+        COALESCE(
+          c.manual_eval_amount_krw,
+          IF(
+            CASE
+              WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+              WHEN c.currency       IS NOT NULL THEN c.currency
+              WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+              WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+              WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+              WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'
+              ELSE NULL
+            END = 'KRW',
+            c.eval_amount,
+            c.eval_amount * fx.usd_krw_rate
+          )
+        )
+        -
+        IF(
+          CASE
+            WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+            WHEN c.currency       IS NOT NULL THEN c.currency
+            WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+            WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+            WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+            WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'
+            ELSE NULL
+          END = 'KRW',
+          COALESCE(c.manual_purchase_amount, c.purchase_amount),
+          COALESCE(c.manual_purchase_amount, c.purchase_amount) * fx.usd_krw_rate
+        )
+      ),
+      0
+    ) AS eval_profit_loss_amount_krw,
+    IFNULL(
+      d.dividend_per_share * c.quantity *
+      IF(
+        CASE
+          WHEN c.manual_currency IS NOT NULL THEN c.manual_currency
+          WHEN c.currency       IS NOT NULL THEN c.currency
+          WHEN c.exchange_code IN ('NASD','NYSE','AMEX','XNAS','XNYS') THEN 'USD'
+          WHEN c.exchange_code = 'SEHK' THEN 'HKD'
+          WHEN c.exchange_code = 'TSE'  THEN 'JPY'
+          WHEN REGEXP_CONTAINS(CAST(c.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW'
+          ELSE NULL
+        END = 'USD',
+        0.85 * fx.usd_krw_rate, 1
+      ),
+      0
+    ) AS daily_dividend_income_krw,
+
+    IFNULL(o.buy_amount_krw, 0)  AS buy_amount_krw,
+    IFNULL(o.sell_amount_krw, 0) AS sell_amount_krw,
+    o.buy_avg_price,
+    o.sell_avg_price,
+    w.weights
+  FROM with_map c
+  LEFT JOIN fx_ffill   fx USING (inquiry_date)
+  LEFT JOIN divs       d  USING (ticker, inquiry_date)
+  LEFT JOIN orders_agg o  USING (inquiry_date, account_nickname, ticker)
+  LEFT JOIN weights    w  USING (ticker)
+),
+manual_only_today AS (
+  SELECT
+    CURRENT_DATE('Asia/Seoul') AS inquiry_date,
+    m.account_nickname,
+    m.ticker,
+    m.product_name,
+    m.asset_class,
+    COALESCE(
+      m.currency,
+      CASE WHEN REGEXP_CONTAINS(CAST(m.ticker AS STRING), r'^\d{5,6}$') THEN 'KRW' END
+    ) AS currency,
+    CAST(NULL AS FLOAT64) AS quantity,
+    CAST(NULL AS FLOAT64) AS avg_purchase_price,
+    m.purchase_amount AS purchase_amount,
+    CAST(NULL AS FLOAT64) AS current_price,
+    CAST(NULL AS FLOAT64) AS eval_amount,
+    fx.usd_krw_rate,
+    m.eval_amount_krw AS eval_amount_krw,
+    m.eval_amount_krw
+      - IF(COALESCE(m.currency, 'KRW')='KRW', m.purchase_amount, m.purchase_amount * fx.usd_krw_rate)
+      AS eval_profit_loss_amount_krw,
+    0.0 AS daily_dividend_income_krw,
+    0.0 AS buy_amount_krw,
+    0.0 AS sell_amount_krw,
+    CAST(NULL AS FLOAT64) AS buy_avg_price,
+    CAST(NULL AS FLOAT64) AS sell_avg_price,
+    w.weights
+  FROM manual_base AS m
+  CROSS JOIN (
+    SELECT COALESCE(
+             (SELECT ANY_VALUE(usd_krw_rate) FROM fx_ffill WHERE inquiry_date = CURRENT_DATE('Asia/Seoul')),
+             (SELECT rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` ORDER BY inquiry_date DESC LIMIT 1),
+             1.0
+           ) AS usd_krw_rate
+  ) fx
+  LEFT JOIN weights w USING (ticker)
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM assets_base a
+    WHERE a.inquiry_date = CURRENT_DATE('Asia/Seoul')
+      AND a.account_nickname = m.account_nickname
+      AND a.ticker = m.ticker
+  )
+)
+
+SELECT * EXCEPT(book_cost_krw) FROM final
+UNION ALL
+SELECT * FROM manual_only_today
