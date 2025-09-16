@@ -205,6 +205,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# Dataform (GCP)
+ds.json
 dataform/workflow_settings.yaml
