@@ -46,7 +46,7 @@ run_job:
     - done:
         return: ${ex}
 
-# ===== dataform helpers (http.request 사용) =====
+# ===== dataform helpers =====
 wait_df:
   params: [invocation_name]  
   steps:
@@ -78,7 +78,6 @@ wait_df:
 run_dataform_workspace:
   params: [project, region, repo, workspace, tag, runner_sa]
   steps:
-    # 1) compilationResults.create
     - compile_req:
         call: http.request
         args:
@@ -92,8 +91,6 @@ run_dataform_workspace:
     - set_cr:
         assign:
           - cr: ${cr_resp.body}
-
-    # 2) workflowInvocations.create
     - invoke_req:
         call: http.request
         args:
@@ -111,8 +108,6 @@ run_dataform_workspace:
     - set_inv:
         assign:
           - inv: ${inv_resp.body}
-
-    # 3) wait until finished
     - wait:
         call: wait_df
         args:
@@ -123,18 +118,21 @@ run_dataform_workspace:
 
 # ===== main =====
 main:
+  params: [project, region, df_repo, df_ws]   
   steps:
     - init:
         assign:
-          - P: "rising-parser-464807-f6"
-          - R: "asia-northeast3"
-          - DR: "asia-northeast3"          
+          - P: ${ default(project, sys.get_env("GOOGLE_CLOUD_PROJECT_ID")) }
+          - R: ${ default(region,  sys.get_env("GOOGLE_CLOUD_LOCATION")) }
+          - DF_REPO: ${ default(df_repo, sys.get_env("DF_REPO")) }
+          - DF_WS:   ${ default(df_ws,   sys.get_env("DF_WS")) }
+
+          - DR: ${R}
           - KIS: ${"projects/" + P + "/locations/" + R + "/jobs/kis-api"}
           - NB:  ${"projects/" + P + "/locations/" + R + "/jobs/nb-job"}
           - MPT: ${"projects/" + P + "/locations/" + R + "/jobs/mpt-job"}
-          - DF_REPO: "analysisP"           
-          - DF_WS:   "analysis"               
-          - DF_SA:   ${"dataform-runner@" + P + ".iam.gserviceaccount.com"}
+          - DF_SA: ${"dataform-runner@" + P + ".iam.gserviceaccount.com"}
+
 
 
     # 1) kis-api
@@ -188,7 +186,7 @@ main:
     - f3:
         raise: '${"mpt-job failed: " + json.encode_to_string(e3)}'
 
-    # 4) Dataform (analysis 태그 실행)
+    # 4) Dataform
     - s4_df:
         call: run_dataform_workspace
         args:

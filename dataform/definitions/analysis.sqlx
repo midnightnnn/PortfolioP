@@ -1,3 +1,4 @@
+-- dataform/definitions/analysis.sqlx
 config {
   type: "incremental",
   schema: "portfolio",
@@ -12,7 +13,7 @@ config {
 
 WITH
 assets_base AS (
-  SELECT * FROM `rising-parser-464807-f6.portfolio.assets`
+  SELECT * FROM ${ref("assets")}
 ),
 manual_base AS (
   WITH manual_ranked AS (
@@ -30,7 +31,7 @@ manual_base AS (
                      JSON_VALUE(TO_JSON_STRING(t), '$.ticker')
         ORDER BY SAFE_CAST(JSON_VALUE(TO_JSON_STRING(t), '$.inquiry_date') AS DATE) DESC
       ) AS rn
-    FROM `rising-parser-464807-f6.portfolio.manual_sheet` AS t
+    FROM ${ref("manual_sheet")} AS t
   )
   SELECT
     account_nickname,
@@ -98,7 +99,7 @@ with_map AS (
     c.*,
     ac.asset_class AS map_asset_class
   FROM combined0 c
-  LEFT JOIN `rising-parser-464807-f6.portfolio.asset_class` ac
+  LEFT JOIN ${ref("asset_class")} ac
     USING (ticker)
 ),
 calendar AS (
@@ -112,12 +113,12 @@ fx_ffill AS (
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS usd_krw_rate
   FROM calendar cal
-  LEFT JOIN `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+  LEFT JOIN ${ref("daily_exchange_rates")} f
     USING (inquiry_date)
 ),
 divs AS (
   SELECT ticker, ex_dividend_date AS inquiry_date, dividend_per_share
-  FROM `rising-parser-464807-f6.portfolio.dividend_history`
+  FROM ${ref("dividend_history")}
 ),
 orders_agg AS (
   SELECT
@@ -127,7 +128,7 @@ orders_agg AS (
     SUM(
       IF(CONTAINS_SUBSTR(order_type, "매수"),
          total_amount * IF(currency = "KRW", 1,
-           (SELECT f.rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+           (SELECT f.rate FROM ${ref("daily_exchange_rates")} f
              WHERE f.inquiry_date = o.order_date)
          ),
          0)
@@ -135,14 +136,14 @@ orders_agg AS (
     SUM(
       IF(CONTAINS_SUBSTR(order_type, "매도"),
          total_amount * IF(currency = "KRW", 1,
-           (SELECT f.rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` f
+           (SELECT f.rate FROM ${ref("daily_exchange_rates")} f
              WHERE f.inquiry_date = o.order_date)
          ),
          0)
     ) AS sell_amount_krw,
     AVG(IF(CONTAINS_SUBSTR(order_type, "매수"), avg_price, NULL)) AS buy_avg_price,
     AVG(IF(CONTAINS_SUBSTR(order_type, "매도"), avg_price, NULL)) AS sell_avg_price
-  FROM `rising-parser-464807-f6.portfolio.orders` o
+  FROM ${ref("orders")} o
   WHERE NOT REGEXP_CONTAINS(IFNULL(order_type, ''), r'(정정|취소)')
   GROUP BY 1,2,3
 ),
@@ -154,7 +155,7 @@ weights AS (
     SELECT
       ticker, strategy, weight,
       ROW_NUMBER() OVER (PARTITION BY ticker, strategy ORDER BY run_date DESC) rn
-    FROM `rising-parser-464807-f6.portfolio.target_allocations`
+    FROM ${ref("target_allocations")}
     WHERE run_date <= CURRENT_DATE("Asia/Seoul")
   )
   WHERE rn = 1
@@ -306,7 +307,7 @@ manual_only_today AS (
   CROSS JOIN (
     SELECT COALESCE(
              (SELECT ANY_VALUE(usd_krw_rate) FROM fx_ffill WHERE inquiry_date = CURRENT_DATE('Asia/Seoul')),
-             (SELECT rate FROM `rising-parser-464807-f6.portfolio.daily_exchange_rates` ORDER BY inquiry_date DESC LIMIT 1),
+             (SELECT rate FROM ${ref("daily_exchange_rates")} ORDER BY inquiry_date DESC LIMIT 1),
              1.0
            ) AS usd_krw_rate
   ) fx
