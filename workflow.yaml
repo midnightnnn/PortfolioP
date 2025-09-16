@@ -1,0 +1,205 @@
+# ===== helpers =====
+wait_exec:
+  params: [exec_name]
+  steps:
+    - get:
+        call: googleapis.run.v2.projects.locations.jobs.executions.get
+        args:
+          name: ${exec_name}
+        result: e
+    - not_done:
+        switch:
+          - condition: ${e.completionTime == null or e.completionTime == ""}
+            next: sleep
+        next: done
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: 5
+        next: get
+    - done:
+        return: ${e}
+
+run_job:
+  params: [job_name, body]
+  steps:
+    - run:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${job_name}
+          body: ${body}
+        result: op
+    - wait_created:
+        call: googleapis.run.v2.projects.locations.operations.wait
+        args:
+          name: ${op.name}
+    - list_execs:
+        call: googleapis.run.v2.projects.locations.jobs.executions.list
+        args:
+          parent: ${job_name}
+        result: ls
+    - wait_done:
+        call: wait_exec
+        args:
+          exec_name: ${ls.executions[0].name}
+        result: ex
+    - done:
+        return: ${ex}
+
+# ===== dataform helpers =====
+wait_df:
+  params: [invocation_name]  
+  steps:
+    - get:
+        call: http.request
+        args:
+          method: GET
+          url: ${"https://dataform.googleapis.com/v1beta1/" + invocation_name}
+          auth:
+            type: OAuth2
+        result: r
+    - check:
+        switch:
+          - condition: ${r.body.state == "SUCCEEDED"}
+            next: ok
+          - condition: ${r.body.state == "FAILED" or r.body.state == "CANCELLED"}
+            next: fail
+        next: sleep
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: 5
+        next: get
+    - ok:
+        return: ${r.body}
+    - fail:
+        raise: '${"Dataform invocation failed: " + json.encode_to_string(r.body)}'
+
+run_dataform_workspace:
+  params: [project, region, repo, workspace, tag, runner_sa]
+  steps:
+    - compile_req:
+        call: http.request
+        args:
+          method: POST
+          url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/" + repo + "/compilationResults"}
+          auth:
+            type: OAuth2
+          body:
+            workspace: ${"projects/" + project + "/locations/" + region + "/repositories/" + repo + "/workspaces/" + workspace}
+        result: cr_resp
+    - set_cr:
+        assign:
+          - cr: ${cr_resp.body}
+    - invoke_req:
+        call: http.request
+        args:
+          method: POST
+          url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/" + repo + "/workflowInvocations"}
+          auth:
+            type: OAuth2
+          body:
+            compilationResult: ${cr.name}
+            invocationConfig:
+              includedTags:
+                - ${tag}
+              serviceAccount: ${runner_sa}
+        result: inv_resp
+    - set_inv:
+        assign:
+          - inv: ${inv_resp.body}
+    - wait:
+        call: wait_df
+        args:
+          invocation_name: ${inv.name}
+        result: done
+    - return:
+        return: ${done}
+
+# ===== main =====
+main:
+  params: [project, region, df_repo, df_ws]   
+  steps:
+    - init:
+        assign:
+          - P: ${ default(project, sys.get_env("GOOGLE_CLOUD_PROJECT_ID")) }
+          - R: ${ default(region,  sys.get_env("GOOGLE_CLOUD_LOCATION")) }
+          - DF_REPO: ${ default(df_repo, sys.get_env("DF_REPO")) }
+          - DF_WS:   ${ default(df_ws,   sys.get_env("DF_WS")) }
+
+          - DR: ${R}
+          - KIS: ${"projects/" + P + "/locations/" + R + "/jobs/kis-api"}
+          - NB:  ${"projects/" + P + "/locations/" + R + "/jobs/nb-job"}
+          - MPT: ${"projects/" + P + "/locations/" + R + "/jobs/mpt-job"}
+          - DF_SA: ${"dataform-runner@" + P + ".iam.gserviceaccount.com"}
+
+
+
+    # 1) kis-api
+    - s1:
+        call: run_job
+        args:
+          job_name: ${KIS}
+          body: {}
+        result: e1
+    - c1:
+        switch:
+          - condition: ${ default(map.get(e1,"failedCount"),0) == 0
+                         and default(map.get(e1,"cancelledCount"),0) == 0
+                         and default(map.get(e1,"succeededCount"),0) >= default(map.get(e1,"taskCount"),0) }
+            next: s2
+        next: f1
+    - f1:
+        raise: '${"kis-api failed: " + json.encode_to_string(e1)}'
+
+    # 2) nb-job
+    - s2:
+        call: run_job
+        args:
+          job_name: ${NB}
+          body: {}
+        result: e2
+    - c2:
+        switch:
+          - condition: ${ default(map.get(e2,"failedCount"),0) == 0
+                         and default(map.get(e2,"cancelledCount"),0) == 0
+                         and default(map.get(e2,"succeededCount"),0) >= default(map.get(e2,"taskCount"),0) }
+            next: s3
+        next: f2
+    - f2:
+        raise: '${"nb-job failed: " + json.encode_to_string(e2)}'
+
+    # 3) mpt-job
+    - s3:
+        call: run_job
+        args:
+          job_name: ${MPT}
+          body: {}
+        result: e3
+    - c3:
+        switch:
+          - condition: ${ default(map.get(e3,"failedCount"),0) == 0
+                         and default(map.get(e3,"cancelledCount"),0) == 0
+                         and default(map.get(e3,"succeededCount"),0) >= default(map.get(e3,"taskCount"),0) }
+            next: s4_df
+        next: f3
+    - f3:
+        raise: '${"mpt-job failed: " + json.encode_to_string(e3)}'
+
+    # 4) Dataform
+    - s4_df:
+        call: run_dataform_workspace
+        args:
+          project: ${P}
+          region: ${R}
+          repo: ${DF_REPO}
+          workspace: ${DF_WS}
+          tag: "analysis"
+          runner_sa: ${DF_SA}
+        result: df
+    - done:
+        return:
+          kis_all: ${e1.name}
+          nb: ${e2.name}
+          mpt: ${e3.name}
+          analysis: ${df.name}

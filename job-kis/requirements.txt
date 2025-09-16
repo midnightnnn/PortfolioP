@@ -1,0 +1,28 @@
+# Web
+flask>=3.0
+gunicorn>=21.2
+# Core
+requests>=2.31
+python-dotenv>=1.0
+# GCP
+google-cloud-secret-manager>=2.18
+google-cloud-firestore>=2.14
+google-cloud-bigquery>=3.17
+google-cloud-bigquery-storage>=2.25.0
+db-dtypes>=1.2.0
+pyarrow>=14.0  
+# Google APIs (Sheets)
+google-api-python-client>=2.141
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+httplib2>=0.22.0  
+# Data
+pandas>=2.2.2
+pandas-gbq>=0.26.1
+numpy>=1.26.4
+yfinance>=0.2.40
+# KRX
+pykrx>=1.0.45
+lxml>=5.2.2
+# Timezone DB for zoneinfo
+tzdata>=2024.1     
