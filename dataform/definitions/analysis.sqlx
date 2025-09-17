@@ -319,8 +319,16 @@ manual_only_today AS (
       AND a.account_nickname = m.account_nickname
       AND a.ticker = m.ticker
   )
+),
+all_rows AS (
+  SELECT * EXCEPT(book_cost_krw) FROM final
+  UNION ALL
+  SELECT * FROM manual_only_today
 )
-
-SELECT * EXCEPT(book_cost_krw) FROM final
-UNION ALL
-SELECT * FROM manual_only_today
+SELECT
+  ar.*,
+  SAFE_DIVIDE(
+    ar.eval_amount_krw,
+    NULLIF(SUM(ar.eval_amount_krw) OVER (PARTITION BY ar.inquiry_date), 0)
+  ) AS actual_weight_total
+FROM all_rows ar
