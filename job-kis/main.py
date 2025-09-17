@@ -341,7 +341,7 @@ def get_kis_configs() -> dict:
         _, project_id = google.auth.default()
 
     client = secretmanager.SecretManagerServiceClient()
-    name   = f"projects/{project_id}/secrets/KISAPI/versions/latest"
+    name   = "[SECRET_MANAGER_PATH]" # 실제 값은 환경 변수나 구성 파일로 대체
     resp   = client.access_secret_version(request={"name": name})
     return json.loads(resp.payload.data.decode())
 
