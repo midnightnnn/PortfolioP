@@ -8,10 +8,10 @@ import os, json, logging, requests
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from google.cloud import secretmanager, firestore
+import hashlib
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from google.oauth2 import service_account
 from google.auth import default
 from googleapiclient.discovery import build
 from google.cloud import bigquery
@@ -363,7 +363,8 @@ def get_new_kis_token(app_key:str, app_secret:str) -> dict|None:
         return None
 
 def get_or_refresh_token(app_key: str, app_secret: str) -> str | None:
-    doc = db.collection("api_tokens").document(f"kis_token_{app_key}")
+    doc_id = "kis_token_" + hashlib.sha256(app_key.encode()).hexdigest()[:16]
+    doc = db.collection("api_tokens").document(doc_id)
 
     try:
         snap = doc.get()
@@ -948,11 +949,7 @@ def sync_market_data():
 def get_manual_data_from_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     try:
         scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-
-        if os.path.exists("service_account.json"):
-            creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=scopes)
-        else:
-            creds, _ = default(scopes=scopes)
+        creds, _ = default(scopes=scopes)
         svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
         rows = svc.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range=sheet_name
