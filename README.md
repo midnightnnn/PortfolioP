@@ -60,7 +60,8 @@ graph TD
     end
 ```
 
-- 루커스튜디오 링크(모바일용) : https://lookerstudio.google.com/reporting/4eab2fb1-54b6-4e0d-acd6-a77513563a20/page/A4BVF
+- 루커스튜디오 링크(모바일용)  
+- https://lookerstudio.google.com/reporting/4eab2fb1-54b6-4e0d-acd6-a77513563a20/page/A4BVF
   
 <table>
   <tr>
@@ -82,7 +83,7 @@ graph TD
 
   * 자동화된 데이터 수집: KIS API를 통해 계좌 잔고, 자산 현황, 주문 내역을 매일 자동으로 가져옵니다.
   * 시장 데이터 통합: `yfinance`와 `pykrx`를 활용하여 개별 주식의 일별 시세(OHLCV), 배당 정보, 환율 등 시장 데이터를 수집합니다.
-  * 수동 데이터 관리: 수Google Sheets에 수동으로 입력해야 하는 자산 정보를 파이프라인에 자동으로 통합합니다.
+  * 수동 데이터 관리: Google Sheets에 수동으로 입력해야 하는 자산 정보를 파이프라인에 자동으로 통합합니다.
   * 시계열 예측 모델: 딥러닝 모델인 N-BEATS를 사용하여 각 자산의 미래 기대수익률을 예측하고, 이를 포트폴리오 최적화에 활용합니다.
   * 다양한 포트폴리오 최적화:
       * 현대 포트폴리오 이론(MPT) 기반 최소 분산(Min Volatility) 및 최대 샤프 지수(Max Sharpe) 전략
